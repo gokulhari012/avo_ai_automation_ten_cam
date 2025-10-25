@@ -1,0 +1,6 @@
+Normal_cam:1=886
+Normal_cam:2=6225
+Normal_cam:3=7721
+Normal_cam:4=10584
+Normal_cam:5=12272
+Normal_cam:6=13394

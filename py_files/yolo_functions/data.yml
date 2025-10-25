@@ -1,0 +1,14 @@
+train: C:\AI-Software\avo_automation_yolo\my_app\colleged_dataset
+val: C:\AI-Software\avo_automation_yolo\my_app\colleged_dataset
+nc: 10
+names:
+- brushID_0
+- brushID_1
+- brushID_2
+- brushID_3
+- brushID_4
+- brushID_5
+- brushID_6
+- brushID_7
+- brushID_8
+- brushID_9
