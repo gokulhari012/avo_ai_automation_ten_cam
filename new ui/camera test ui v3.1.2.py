@@ -42,7 +42,11 @@ TARGET_UI_FPS = 30   # set to 24 or 30 as you like
 # Camera UI code (unchanged in behaviour / layout)
 # -----------------------------
 
+file_lock = threading.Lock()  # global lock for file access
+
 camera_index_list = [0,1,2,3,4,5]
+normal_cam_offset_value=[]
+tele_cam_offset_value=[]
 
 with open("configuration.json", "r") as file:
     json_data = json.load(file)
@@ -59,41 +63,53 @@ def tele_cam_offset_value_write(cam_index, value):
     
 def cam_offset_value_write(cam_index, value):
     """Write or update a camera index and its value in the file."""
-    data = {}
+    if file_lock:
+        data = {}
 
-    # Read existing data if file exists
-    if os.path.exists(FILE_PATH):
-        with open(FILE_PATH, "r") as f:
-            for line in f:
-                parts = line.strip().split("=", 1)
-                if len(parts) == 2:
-                    data[parts[0]] = parts[1]
+        # Read existing data if file exists
+        if os.path.exists(FILE_PATH):
+            with open(FILE_PATH, "r") as f:
+                for line in f:
+                    parts = line.strip().split("=", 1)
+                    if len(parts) == 2:
+                        data[parts[0]] = parts[1]
 
-    # Update or add new entry
-    data[str(cam_index)] = str(value)
+        # Update or add new entry
+        data[str(cam_index)] = str(value)
 
-    # Write back to file
-    with open(FILE_PATH, "w") as f:
-        for key, val in data.items():
-            f.write(f"{key}={val}\n")
+        # Write back to file
+        with open(FILE_PATH, "w") as f:
+            for key, val in data.items():
+                f.write(f"{key}={val}\n")
 
 def normal_cam_offset_value_read(cam_index):
-    cam_offset_value_read("Normal_cam:"+str(cam_index))
+    global normal_cam_offset_value
+    if len(normal_cam_offset_value) < 6:
+        normal_cam_offset_value=[]
+        for i in range(1,7):
+            normal_cam_offset_value.append(cam_offset_value_read("Normal_cam:"+str(i)))
+    return normal_cam_offset_value[cam_index]
 
 def tele_cam_offset_value_read(cam_index):
-    cam_offset_value_read("Tele_cam:"+str(cam_index))
+    global tele_cam_offset_value
+    if len(tele_cam_offset_value) < 4:
+        tele_cam_offset_value=[]
+        for i in range(1,5):
+            tele_cam_offset_value.append(cam_offset_value_read("Tele_cam:"+str(i)))
+    return tele_cam_offset_value[cam_index]
     
 def cam_offset_value_read(cam_index):
     """Read a camera index value from the file."""
-    if not os.path.exists(FILE_PATH):
-        return None
+    if file_lock:
+        if not os.path.exists(FILE_PATH):
+            return None
 
-    with open(FILE_PATH, "r") as f:
-        for line in f:
-            parts = line.strip().split("=", 1)
-            if len(parts) == 2 and parts[0] == str(cam_index):
-                return parts[1]
-    return None
+        with open(FILE_PATH, "r") as f:
+            for line in f:
+                parts = line.strip().split("=", 1)
+                if len(parts) == 2 and parts[0] == str(cam_index):
+                    return parts[1]
+        return None
 
 class FramePacket:
     __slots__ = ("frame", "ts")
@@ -200,6 +216,11 @@ class UVC_CameraThread(QThread):
             pass
         self._cap = None
 
+    def capture_image(self):
+        if(self._running):
+           frame = self._cap.read()
+           return frame
+ 
     def stop(self):
         self._running = False
         self.wait(1500)
@@ -248,6 +269,7 @@ class BAS_CameraThread(QThread):
                 if grab.GrabSucceeded():
                     img = converter.Convert(grab)
                     frame = img.GetArray()
+                    self._frame = frame
                     self.frame_ready.emit(FramePacket(frame))
                     frames += 1
                     now = time.time()
@@ -262,6 +284,11 @@ class BAS_CameraThread(QThread):
             self.error_signal.emit(f"Basler {self.index}: {e}")
         finally:
             self._shutdown()
+
+    def capture_image(self):
+        if(self._running):
+           frame = self._frame
+           return frame
 
     def _shutdown(self):
         self._running = False
@@ -599,16 +626,26 @@ class UVC_CameraWidget(_BaseCameraWidget2):
     def __init__(self, label, index):
         self.index = index
         super().__init__(label)
+    
     def _make_thread(self) -> QThread:
-        return UVC_CameraThread(self.index, WIDTH, HEIGHT)
-
+        self.cameraThread = UVC_CameraThread(self.index, WIDTH, HEIGHT)
+        return self.cameraThread
+    
+    def getCameraThread(self):
+        return self.cameraThread
+        
 class BAS_CameraWidget(_BaseCameraWidget1):
     def __init__(self, label, index):
         self.index = index
         super().__init__(label)
+    
     def _make_thread(self) -> QThread:
-        return BAS_CameraThread(self.index, TC_WIDTH, TC_HEIGHT)
-
+        self.cameraThread = BAS_CameraThread(self.index, TC_WIDTH, TC_HEIGHT)
+        return self.cameraThread 
+    
+    def getCameraThread(self):
+        return self.cameraThread
+    
 # -----------------------------
 # Servo Modbus Panel (Qt widget)
 # -----------------------------
@@ -796,6 +833,17 @@ class ServoControlPanel(QWidget):
         except Exception as e:
             self._show_error(str(e))
             return False
+        
+    def _read_coil(self, address: int):
+        try:
+            with self.lock:
+                rr = self.client.read_coils(address)
+            if hasattr(rr, "isError") and rr.isError():
+                raise Exception(f"Read error at {address}: {rr}")
+            return rr.bits[0]
+        except Exception as e:
+            self._show_error(str(e))
+            return None
 
     # ---------------------------
     # UI callbacks
@@ -823,6 +871,7 @@ class ServoControlPanel(QWidget):
             self._show_error("Offset must be integer")
             return
         self._write_register(addr, v)
+        tele_cam_offset_value_write(cam_idx, v)
 
     def on_write_normal_cam_offset(self, cam_idx: int):
         le = self.normal_cam_entries[cam_idx]
@@ -888,6 +937,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("High FPS Multi-Camera Viewer + Servo Control")
         self.setMinimumSize(1600, 900)
         self._init_ui()
+        self.mainloop = threading.Thread(target=self.mainloop)
+        self.mainloop.start()
 
     def _init_ui(self):
         central = QWidget()
@@ -896,19 +947,20 @@ class MainWindow(QMainWindow):
         left_grid  = QGridLayout()
         right_grid = QGridLayout()
 
-        self.cameras = []
+        self.normal_cameras = []
+        self.tele_cameras = []
 
         # 6 UVC (left grid)
         for i in range(6):
             cam = UVC_CameraWidget(f"UVC Camera {i+1}", i)
-            self.cameras.append(cam)
+            self.normal_cameras.append(cam)
             r, c = divmod(i, 2)
             left_grid.addWidget(cam, r, c)
 
         # 4 Basler (middle/right grid)
         for i in range(4):
             cam = BAS_CameraWidget(f"Basler Camera {i+1}", i)
-            self.cameras.append(cam)
+            self.tele_cameras.append(cam)
             r, c = divmod(i, 2)
             right_grid.addWidget(cam, r, c)
 
@@ -923,9 +975,31 @@ class MainWindow(QMainWindow):
         central.setLayout(main_layout)
         self.setCentralWidget(central)
 
+    def mainloop(self):
+        brushContainer = []
+        brushId = 0
+        while True:
+            isBrushDetected = self.servo_panel._read_coil(4)
+            #print(isBrushDetected)
+            if(isBrushDetected):
+                print("Brush Triggered")
+                time.sleep(0.1)
+                sensorTriggeredPosition = self.servo_panel._read_register(100)
+                #livePosition = int(self.servo_panel._read_register(104))
+                #print("Live Position: "+str(livePosition))
+                print("Sensor Triggered Position:"+str(sensorTriggeredPosition))
+                brushId+=1
+                brushThread = BrushThread(brushId, sensorTriggeredPosition, self.normal_cameras, self.tele_cameras, self.servo_panel)
+                brushContainer.append(brushThread)
+                while(isBrushDetected):
+                    isBrushDetected = self.servo_panel._read_coil(4)
+            time.sleep(0.1)
+        
     def closeEvent(self, event):
         # stop camera threads
-        for cam in self.cameras:
+        for cam in self.normal_cameras:
+            cam.stop_camera_on_close()
+        for cam in self.tele_cameras:
             cam.stop_camera_on_close()
         # stop servo panel
         try:
@@ -934,6 +1008,56 @@ class MainWindow(QMainWindow):
             pass
         super().closeEvent(event)
 
+class BrushThread():
+    def __init__(self, brushID: int, sensorTriggeredPosition, normal_cameras, tele_cameras, servo_panel: ServoControlPanel):
+        self.brushID = brushID
+        self.sensorTriggeredPosition = sensorTriggeredPosition
+        self.normal_cameras = normal_cameras 
+        self.tele_cameras = tele_cameras 
+        self.servo_panel = servo_panel
+        self.run = threading.Thread(target=self.run)
+        self.run.start()
+
+    def run(self):
+        normal_camere_future_positions = []
+        tele_camera_future_positions = []
+        for cam in self.normal_cameras:
+            #print(cam.index)
+            normal_cam_position = normal_cam_offset_value_read(cam.index)
+            if normal_cam_position:
+                normal_camere_future_positions.append(int(normal_cam_position)+self.sensorTriggeredPosition)
+            else:
+                normal_camere_future_positions.append(0)
+        for cam in self.tele_cameras:
+            tele_cam_position = tele_cam_offset_value_read(cam.index)
+            if tele_cam_position:
+                tele_camera_future_positions.append(int(tele_cam_position)+self.sensorTriggeredPosition)
+            else:
+                tele_camera_future_positions.append(0)
+
+        tolarance=200
+        normal_cam_index=0
+        tele_cam_index=0
+        
+        while(True):    
+            livePosition = int(self.servo_panel._read_register(104))
+            #print("Live Position: "+str(livePosition))
+            #print(normal_camere_future_positions)
+            #print("Normal Cam future position: "+str(normal_camere_future_positions[normal_cam_index]))
+            if(normal_cam_index < len(normal_camere_future_positions)):
+                if(livePosition is not None and normal_camere_future_positions[normal_cam_index]-tolarance <= livePosition <= normal_camere_future_positions[normal_cam_index]+tolarance):
+                    print(f"Capturing images for Brush ID: {self.brushID} at position {livePosition} for Normal Camera {normal_cam_index+1}")
+                    self.normal_cameras[normal_cam_index].getCameraThread().capture_image()
+                    normal_cam_index+=1
+            
+            if(tele_cam_index < len(tele_camera_future_positions)):
+                if(livePosition is not None and tele_camera_future_positions[tele_cam_index]-tolarance <= livePosition <= tele_camera_future_positions[tele_cam_index]+tolarance):
+                    print(f"Capturing images for Brush ID: {self.brushID} at position {livePosition} for Tele Camera {tele_cam_index+1}")
+                    self.tele_cameras[normal_cam_index].getCameraThread().capture_image()
+                    tele_cam_index+=1
+
+            time.sleep(0.1)
+    
 # -----------------------------
 # Example: optional processor hook (kept same)
 # -----------------------------
