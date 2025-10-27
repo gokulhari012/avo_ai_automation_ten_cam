@@ -13,7 +13,7 @@ from pypylon import pylon
 from PySide6.QtWidgets import (
     QApplication, QLabel, QPushButton, QVBoxLayout, QWidget,
     QHBoxLayout, QGridLayout, QMainWindow, QFrame, QSizePolicy,
-    QLineEdit, QGroupBox, QFormLayout, QSpacerItem, QSizePolicy as QSP
+    QLineEdit, QGroupBox, QFormLayout, QSpacerItem, QSizePolicy as QSP, QTableWidget, QTableWidgetItem, QTabWidget
 )
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer
@@ -928,6 +928,85 @@ class ServoControlPanel(QWidget):
         except Exception:
             pass
 
+class BrushStatusPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout()
+
+        title = QLabel("<b>Brush Current Status & History</b>")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        # Create Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(11)
+        headers = ["ID"] + [f"{i}" for i in range(1, 11)]
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        # ✅ Set column widths
+        self.table.setColumnWidth(0, 40)  # BrushID column
+        for i in range(1, 11):
+            self.table.setColumnWidth(i, 40)  # Camera columns
+        layout.addWidget(self.table)
+
+        self.setLayout(layout)
+
+        # # Fill with sample data (for testing)
+        # for row in range(5):
+        #     self.add_brush_result(row + 1, [("Good" if (row + i) % 2 == 0 else "Bad") for i in range(1, 11)])
+
+    def add_brush_result(self, brush_id: int, camera_results: list[str]):
+        """Add one brush record to the table."""
+        # Remove oldest row if 20 rows already exist
+        if self.table.rowCount() >= 20:
+            self.table.removeRow(0)  # removes the first (oldest) row
+
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(str(brush_id)))
+        for i, result in enumerate(camera_results, start=1):
+            item = QTableWidgetItem(result)
+            item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, i, item)
+
+    def update_brush_status(self, brush_id: int, camera_no: int, status: str):
+        """
+        Update the status of a specific camera for a given brush ID.
+        camera_no starts from 1 (since column 0 is BrushID).
+        """
+        target_id = str(brush_id)
+
+        # Loop through all rows to find the brush ID
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.text() == target_id:
+                # Found the brush; now update camera status
+                if 1 <= camera_no <= 10:
+                    new_item = QTableWidgetItem(status)
+                    new_item.setTextAlignment(Qt.AlignCenter)
+                    self.table.setItem(row, camera_no, new_item)
+                else:
+                    print(f"Invalid camera number: {camera_no}")
+                return True
+
+        print(f"Brush ID {brush_id} not found.")
+        return False
+
+    def remove_brush_by_id(self, brush_id: int):
+        """Remove a brush record from the table by its Brush ID."""
+        target_id = str(brush_id)
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.text() == target_id:
+                self.table.removeRow(row)
+                return True  # Successfully removed
+        return False  # Brush ID not found
+    
 # -----------------------------
 # Main window (modified to add Servo panel on right side)
 # -----------------------------
@@ -968,9 +1047,26 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(left_grid, 2)
         main_layout.addLayout(right_grid, 2)
 
-        # Servo control panel on the far right (new column)
+        # -------------------------------
+        # RIGHT PANEL - TabWidget (Status + Settings)
+        # -------------------------------
+
+        # Tab widget for right-side panel
+        self.right_tabs = QTabWidget()
+
+        # Create brush status and servo panels
+        self.brush_status_panel = BrushStatusPanel()
         self.servo_panel = ServoControlPanel()
-        main_layout.addWidget(self.servo_panel, 1)
+
+        # Add both as tabs
+        self.right_tabs.addTab(self.brush_status_panel, "Brush Status")
+        self.right_tabs.addTab(self.servo_panel, "Settings")
+
+        # Default show Brush Status
+        self.right_tabs.setCurrentIndex(0)
+
+        # Add tab widget to main layout
+        main_layout.addWidget(self.right_tabs, 1)
 
         central.setLayout(main_layout)
         self.setCentralWidget(central)
@@ -983,13 +1079,14 @@ class MainWindow(QMainWindow):
             #print(isBrushDetected)
             if(isBrushDetected):
                 print("Brush Triggered")
+                brushId+=1
+                self.brush_status_panel.add_brush_result(brushId, ["Pending"]*10)
                 time.sleep(0.1)
                 sensorTriggeredPosition = self.servo_panel._read_register(100)
                 #livePosition = int(self.servo_panel._read_register(104))
                 #print("Live Position: "+str(livePosition))
                 print("Sensor Triggered Position:"+str(sensorTriggeredPosition))
-                brushId+=1
-                brushThread = BrushThread(brushId, sensorTriggeredPosition, self.normal_cameras, self.tele_cameras, self.servo_panel)
+                brushThread = BrushThread(brushId, sensorTriggeredPosition, self.normal_cameras, self.tele_cameras, self.servo_panel, self.brush_status_panel)
                 brushContainer.append(brushThread)
                 while(isBrushDetected):
                     isBrushDetected = self.servo_panel._read_coil(4)
@@ -1009,12 +1106,13 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 class BrushThread():
-    def __init__(self, brushID: int, sensorTriggeredPosition, normal_cameras, tele_cameras, servo_panel: ServoControlPanel):
+    def __init__(self, brushID: int, sensorTriggeredPosition, normal_cameras, tele_cameras, servo_panel: ServoControlPanel, brush_status_panel: BrushStatusPanel):
         self.brushID = brushID
         self.sensorTriggeredPosition = sensorTriggeredPosition
         self.normal_cameras = normal_cameras 
         self.tele_cameras = tele_cameras 
         self.servo_panel = servo_panel
+        self.brush_status_panel = brush_status_panel
         self.run = threading.Thread(target=self.run)
         self.run.start()
 
@@ -1047,12 +1145,15 @@ class BrushThread():
             if(normal_cam_index < len(normal_camere_future_positions)):
                 if(livePosition is not None and normal_camere_future_positions[normal_cam_index]-tolarance <= livePosition <= normal_camere_future_positions[normal_cam_index]+tolarance):
                     print(f"Capturing images for Brush ID: {self.brushID} at position {livePosition} for Normal Camera {normal_cam_index+1}")
+                    # Update brush 101, camera 3 → "OK"
+                    self.update_brush_status(self.brushID, normal_cam_index+1, "Good")
                     self.normal_cameras[normal_cam_index].getCameraThread().capture_image()
                     normal_cam_index+=1
             
             if(tele_cam_index < len(tele_camera_future_positions)):
                 if(livePosition is not None and tele_camera_future_positions[tele_cam_index]-tolarance <= livePosition <= tele_camera_future_positions[tele_cam_index]+tolarance):
                     print(f"Capturing images for Brush ID: {self.brushID} at position {livePosition} for Tele Camera {tele_cam_index+1}")
+                    self.update_brush_status(self.brushID, tele_cam_index+1, "Good")
                     self.tele_cameras[normal_cam_index].getCameraThread().capture_image()
                     tele_cam_index+=1
 
