@@ -44,6 +44,7 @@ TARGET_UI_FPS = 30   # set to 24 or 30 as you like
 
 file_lock = threading.Lock()  # global lock for file access
 
+plc_ip = "192.168.1.5"
 camera_index_list = [0,1,2,3,4,5]
 normal_cam_offset_value=[]
 tele_cam_offset_value=[]
@@ -689,7 +690,7 @@ class ServoControlPanel(QWidget):
         super().__init__(parent)
         self._build_ui()
         # Modbus client setup
-        self.plc_ip = "192.168.1.5"
+        self.plc_ip = plc_ip
         self.plc_port = 502
         self.client = ModbusTcpClient(host=self.plc_ip, port=self.plc_port)
         self.client.connect()
