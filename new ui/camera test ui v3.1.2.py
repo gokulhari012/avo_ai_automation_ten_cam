@@ -13,9 +13,10 @@ from pypylon import pylon
 from PySide6.QtWidgets import (
     QApplication, QLabel, QPushButton, QVBoxLayout, QWidget,
     QHBoxLayout, QGridLayout, QMainWindow, QFrame, QSizePolicy,
-    QLineEdit, QGroupBox, QFormLayout, QSpacerItem, QSizePolicy as QSP, QTableWidget, QTableWidgetItem, QTabWidget
+    QLineEdit, QGroupBox, QFormLayout, QSpacerItem, QSizePolicy as QSP, QTableWidget, QTableWidgetItem, QTabWidget,
+    QHeaderView, 
 )
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QImage, QPixmap, QBrush, QColor, QFont
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer
 import qdarkstyle
 
@@ -48,6 +49,8 @@ plc_ip = "192.168.1.5"
 camera_index_list = [0,1,2,3,4,5]
 normal_cam_offset_value=[]
 tele_cam_offset_value=[]
+# tele_camera_wait_for_frame = 25000
+tele_camera_wait_for_frame = 100
 
 with open("configuration.json", "r") as file:
     json_data = json.load(file)
@@ -140,7 +143,7 @@ class UVC_CameraThread(QThread):
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0)
-        self._cap.set(cv2.CAP_PROP_EXPOSURE, -7)
+        self._cap.set(cv2.CAP_PROP_EXPOSURE, -9)
         self._cap.set(cv2.CAP_PROP_GAIN, 5)
         self._cap.set(cv2.CAP_PROP_FPS, 30)
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -240,6 +243,9 @@ class BAS_CameraThread(QThread):
         self._camera: Optional[pylon.InstantCamera] = None
 
     def run(self):
+        trigger=1
+        # if (self.index==3): #remove this after the  telecentric camera 1 is wired
+        #     trigger=0
         try:
             tlf = pylon.TlFactory.GetInstance()
             devices = tlf.EnumerateDevices()
@@ -249,6 +255,15 @@ class BAS_CameraThread(QThread):
 
             self._camera = pylon.InstantCamera(tlf.CreateDevice(devices[self.index]))
             self._camera.Open()
+            if trigger:
+                self._camera.TriggerSelector.SetValue('FrameStart')
+                self._camera.TriggerMode.SetValue('On')
+                self._camera.TriggerSource.SetValue('Line1')
+
+            self._camera.ExposureAuto.SetValue('Off')
+            self._camera.ExposureTime.SetValue(200)
+            self._camera.GainAuto.SetValue('Off')
+            self._camera.Gain.SetValue(30.0)
             try:
                 self._camera.Width.SetValue(self.width)
                 self._camera.Height.SetValue(self.height)
@@ -266,8 +281,8 @@ class BAS_CameraThread(QThread):
             frames = 0
 
             while self._running and self._camera.IsGrabbing():
-                grab = self._camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
-                if grab.GrabSucceeded():
+                grab = self._camera.RetrieveResult(tele_camera_wait_for_frame, pylon.TimeoutHandling_Return)
+                if grab.IsValid():
                     img = converter.Convert(grab)
                     frame = img.GetArray()
                     self._frame = frame
@@ -288,8 +303,11 @@ class BAS_CameraThread(QThread):
 
     def capture_image(self):
         if(self._running):
-           frame = self._frame
-           return frame
+           if(self._frame):
+                frame = self._frame
+                return frame
+           else:
+               print("Tele Cam frame not available")
 
     def _shutdown(self):
         self._running = False
@@ -666,21 +684,38 @@ class ModbusPollThread(QThread):
         while self._running:
             try:
                 # read triggered (D100 -> address 100) and live (HC202 -> address 202)
-                with self.lock:
-                    rr1 = self.client.read_holding_registers(100)
-                    rr2 = self.client.read_holding_registers(104)
-                if hasattr(rr1, "isError") and rr1.isError():
-                    raise Exception(f"Read error D100: {rr1}")
-                if hasattr(rr2, "isError") and rr2.isError():
-                    raise Exception(f"Read error HC104: {rr2}")
-                trig = rr1.registers[0]
-                live = rr2.registers[0]
+                trig = self._read_register_32_bit(100)
+                live = self._read_register_32_bit(104)
                 self.update_values.emit(trig, live)
             except Exception as e:
                 # Emit connection error once (UI will show message)
                 self.connection_error.emit(str(e))
             time.sleep(self.poll_interval)
+    
+    def _read_register_32_bit(self, address: int):
+        try:
+            rr = 0
+            with self.lock:
+                rr1 = self.client.read_holding_registers(address)
+                if hasattr(rr1, "isError") and rr1.isError():
+                    raise Exception(f"Read error at {address}: {rr1}")
+                rr1 = rr1.registers[0]
 
+                rr2 = self.client.read_holding_registers(address+1)
+                if hasattr(rr2, "isError") and rr2.isError():
+                    raise Exception(f"Read error at {address}: {rr2}")
+                rr2 = rr2.registers[0]
+                
+                rr = (rr2 << 16) | rr1
+                # rr = (rr1 << 16) | rr2
+                # print("32-bit value:",sensorTriggeredPosition)
+                if rr >= 0x80000000:  # if MSB is 1
+                    rr -= 0x100000000
+            return rr
+        except Exception as e:
+            self._show_error(str(e))
+            return None
+        
     def stop(self):
         self._running = False
         self.wait(500)
@@ -823,7 +858,31 @@ class ServoControlPanel(QWidget):
         except Exception as e:
             self._show_error(str(e))
             return None
+        
+    def _read_register_32_bit(self, address: int):
+        try:
+            rr = 0
+            with self.lock:
+                rr1 = self.client.read_holding_registers(address)
+                if hasattr(rr1, "isError") and rr1.isError():
+                    raise Exception(f"Read error at {address}: {rr1}")
+                rr1 = rr1.registers[0]
 
+                rr2 = self.client.read_holding_registers(address+1)
+                if hasattr(rr2, "isError") and rr2.isError():
+                    raise Exception(f"Read error at {address}: {rr2}")
+                rr2 = rr2.registers[0]
+                
+                rr = (rr2 << 16) | rr1
+                # rr = (rr1 << 16) | rr2
+                # print("32-bit value:",sensorTriggeredPosition)
+                if rr >= 0x80000000:  # if MSB is 1
+                    rr -= 0x100000000
+            return rr
+        except Exception as e:
+            self._show_error(str(e))
+            return None
+        
     def _write_coil(self, address: int, state: bool):
         try:
             with self.lock:
@@ -895,8 +954,8 @@ class ServoControlPanel(QWidget):
         QTimer.singleShot(pulse_ms, lambda: self._write_coil(coil_addr, False))
 
     def on_read_now(self):
-        trig = self._read_register(100)   # D100 -> 100
-        live = self._read_register(104)   # HC202 -> 202
+        trig = self._read_register_32_bit(100)   # D100 -> 100
+        live = self._read_register_32_bit(104)   # HC202 -> 202
         if trig is not None:
             self.entry_triggered.setText(str(trig))
         if live is not None:
@@ -944,15 +1003,45 @@ class BrushStatusPanel(QWidget):
         # Create Table
         self.table = QTableWidget()
         self.table.setColumnCount(11)
-        headers = ["ID"] + [f"{i}" for i in range(1, 11)]
-        self.table.setHorizontalHeaderLabels(headers)
+        self.table.setRowCount(0)
+        # headers = ["ID"] + [f"{i}" for i in range(1, 7)] + [f"{i}" for i in range(1, 5)]
+        # self.table.setHorizontalHeaderLabels(headers)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        # self.header_table.setFixedHeight(60)
+        # self.header_table.setFocusPolicy(Qt.NoFocus)
+        # self.header_table.setSelectionMode(QTableWidget.NoSelection)
+
+         # --- Create fake two-level header using the first row ---
+        top_headers = ["ID", "Normal Camera", "", "", "", "", "", "Tele Camera", "", "", ""]
+        sub_headers = ["Brush"] + [f"{i}" for i in range(1, 7)] + [f"{i}" for i in range(1, 5)]
+
+        # Set the actual header row to sub headers
+        self.table.setHorizontalHeaderLabels(sub_headers)
+
+        # --- Merge the top header visually ---
+        self.table.insertRow(0)
+        for col, text in enumerate(top_headers):
+            item = QTableWidgetItem(text)
+            item.setTextAlignment(Qt.AlignCenter)
+            #item.setBackground(QColor(230, 230, 230))
+            item.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            self.table.setItem(0, col, item)
+
+        # Merge cells manually for group labels
+        self.table.setSpan(0, 0, 1, 1)  # Brush ID
+        self.table.setSpan(0, 1, 1, 6)  # Normal Camera
+        self.table.setSpan(0, 7, 1, 4)  # Tele Camera
+
+        # Optional: resize columns evenly
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch)
+
         # ✅ Set column widths
-        self.table.setColumnWidth(0, 40)  # BrushID column
+        self.table.setColumnWidth(0, 35)  # BrushID column
         for i in range(1, 11):
-            self.table.setColumnWidth(i, 40)  # Camera columns
+            self.table.setColumnWidth(i, 55)  # Camera columns
         layout.addWidget(self.table)
 
         self.setLayout(layout)
@@ -1067,7 +1156,7 @@ class MainWindow(QMainWindow):
         self.right_tabs.setCurrentIndex(0)
 
         # Add tab widget to main layout
-        main_layout.addWidget(self.right_tabs, 1)
+        main_layout.addWidget(self.right_tabs, 2)
 
         central.setLayout(main_layout)
         self.setCentralWidget(central)
@@ -1083,7 +1172,7 @@ class MainWindow(QMainWindow):
                 brushId+=1
                 self.brush_status_panel.add_brush_result(brushId, ["Pending"]*10)
                 time.sleep(0.1)
-                sensorTriggeredPosition = self.servo_panel._read_register(100)
+                sensorTriggeredPosition = self.servo_panel._read_register_32_bit(100)
                 #livePosition = int(self.servo_panel._read_register(104))
                 #print("Live Position: "+str(livePosition))
                 print("Sensor Triggered Position:"+str(sensorTriggeredPosition))
@@ -1147,15 +1236,15 @@ class BrushThread():
                 if(livePosition is not None and normal_camere_future_positions[normal_cam_index]-tolarance <= livePosition <= normal_camere_future_positions[normal_cam_index]+tolarance):
                     print(f"Capturing images for Brush ID: {self.brushID} at position {livePosition} for Normal Camera {normal_cam_index+1}")
                     # Update brush 101, camera 3 → "OK"
-                    self.update_brush_status(self.brushID, normal_cam_index+1, "Good")
+                    self.brush_status_panel.update_brush_status(self.brushID, normal_cam_index+1, "Good")
                     self.normal_cameras[normal_cam_index].getCameraThread().capture_image()
                     normal_cam_index+=1
             
             if(tele_cam_index < len(tele_camera_future_positions)):
                 if(livePosition is not None and tele_camera_future_positions[tele_cam_index]-tolarance <= livePosition <= tele_camera_future_positions[tele_cam_index]+tolarance):
                     print(f"Capturing images for Brush ID: {self.brushID} at position {livePosition} for Tele Camera {tele_cam_index+1}")
-                    self.update_brush_status(self.brushID, tele_cam_index+1, "Good")
-                    self.tele_cameras[normal_cam_index].getCameraThread().capture_image()
+                    self.brush_status_panel.update_brush_status(self.brushID, 6 + tele_cam_index + 1, "Good")
+                    self.tele_cameras[tele_cam_index].getCameraThread().capture_image()
                     tele_cam_index+=1
 
             time.sleep(0.1)
