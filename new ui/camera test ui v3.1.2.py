@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QApplication, QLabel, QPushButton, QVBoxLayout, QWidget,
     QHBoxLayout, QGridLayout, QMainWindow, QFrame, QSizePolicy,
     QLineEdit, QGroupBox, QFormLayout, QSpacerItem, QSizePolicy as QSP, QTableWidget, QTableWidgetItem, QTabWidget,
-    QHeaderView, 
+    QHeaderView, QCheckBox
 )
 from PySide6.QtGui import QImage, QPixmap, QBrush, QColor, QFont
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer
@@ -34,6 +34,10 @@ HEIGHT = 1200
 TC_WIDTH  = 5328
 TC_HEIGHT = 4608
 model_path = "D:/program/brush_knowledge/weights/best.pt"
+
+normal_camera_image_folder = "brush_knowledge/normal_camera_images"
+tele_camera_image_folder = "brush_knowledge/tele_camera_images"
+
 #model = YOLO(model_path)
 #class_names = model.names
 # UI paint throttle (frames-per-second)
@@ -46,16 +50,23 @@ TARGET_UI_FPS = 30   # set to 24 or 30 as you like
 file_lock = threading.Lock()  # global lock for file access
 
 plc_ip = "192.168.1.5"
-camera_index_list = [0,1,2,3,4,5]
+normal_camera_index_list = [0,1,2,3,4,5]
+tele_camera_index_list = [0,1,2,3]
 normal_cam_offset_value=[]
 tele_cam_offset_value=[]
 tele_camera_wait_for_frame = 25000
 #tele_camera_wait_for_frame = 100
+take_picture = False
+
+folder_brush_no = None
+trigger=True # tele centric
+        
 
 with open("configuration.json", "r") as file:
     json_data = json.load(file)
 
-camera_index_list = json_data["camera_index_list"]
+normal_camera_index_list = json_data["normal_camera_index_list"]
+tele_camera_index_list = json_data["tele_camera_index_list"]
 
 NORMAL_CAM_FILE_PATH = "normal_camera_data.txt"
 TELE_CAM_FILE_PATH = "tele_camera_data.txt"
@@ -92,7 +103,7 @@ def normal_cam_offset_value_read(cam_index):
     if len(normal_cam_offset_value) < 6:
         normal_cam_offset_value=[]
         for i in range(1,7):
-            normal_cam_offset_value.append(normal_cam_offset_value_read("Normal_cam:"+str(i)))
+            normal_cam_offset_value.append(normal_cam_offset_value_read_from_file("Normal_cam:"+str(i)))
     return normal_cam_offset_value[cam_index]
 
 def tele_cam_offset_value_read(cam_index):
@@ -100,10 +111,10 @@ def tele_cam_offset_value_read(cam_index):
     if len(tele_cam_offset_value) < 4:
         tele_cam_offset_value=[]
         for i in range(1,5):
-            tele_cam_offset_value.append(tele_cam_offset_value_read("Tele_cam:"+str(i)))
+            tele_cam_offset_value.append(tele_cam_offset_value_read_from_file("Tele_cam:"+str(i)))
     return tele_cam_offset_value[cam_index]
     
-def normal_cam_offset_value_read(cam_index):
+def normal_cam_offset_value_read_from_file(cam_index):
     """Read a camera index value from the file."""
     if file_lock:
         if not os.path.exists(NORMAL_CAM_FILE_PATH):
@@ -116,7 +127,7 @@ def normal_cam_offset_value_read(cam_index):
                     return parts[1]
         return None
 
-def tele_cam_offset_value_read(cam_index):
+def tele_cam_offset_value_read_from_file(cam_index):
     """Read a camera index value from the file."""
     if file_lock:
         if not os.path.exists(TELE_CAM_FILE_PATH):
@@ -149,7 +160,7 @@ class UVC_CameraThread(QThread):
         self._cap = None
 
     def run(self):
-        self._cap = cv2.VideoCapture(camera_index_list[self.index], cv2.CAP_DSHOW)
+        self._cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
         if not self._cap.isOpened():
             self.error_signal.emit(f"UVC {self.index}: failed to open")
             return
@@ -172,7 +183,7 @@ class UVC_CameraThread(QThread):
         
         while self._running:
             if not self._cap.isOpened():
-                self._cap = cv2.VideoCapture(camera_index_list[self.index], cv2.CAP_DSHOW)
+                self._cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
                 time.sleep(2.5)
             ok, frame = self._cap.read()
             if not ok:
@@ -260,10 +271,12 @@ class BAS_CameraThread(QThread):
         self.height = height
         self._running = False
         self._camera: Optional[pylon.InstantCamera] = None
-
-    def run(self):
-        trigger=0
+        self._frame = None
+        self.frame_no = 0
+        self.frame_previous_no = 0
         
+    def run(self):
+
         try:
             tlf = pylon.TlFactory.GetInstance()
             devices = tlf.EnumerateDevices()
@@ -304,6 +317,7 @@ class BAS_CameraThread(QThread):
                     img = converter.Convert(grab)
                     frame = img.GetArray()
                     self._frame = frame
+                    self.frame_no +=1 
                     self.frame_ready.emit(FramePacket(frame))
                     frames += 1
                     now = time.time()
@@ -321,13 +335,15 @@ class BAS_CameraThread(QThread):
 
     def capture_image(self):
         if(self._running):
-            frame = self._frame
-            return frame
-          #if(self._frame!=None):
-          #      frame = self._frame
-          #      return frame
-          #else:
-          #     print("Tele Cam frame not available")'''
+            while(self.frame_no == self.frame_previous_no):
+                pass
+            self.frame_previous_no = self.frame_no
+            if self._frame is not None:
+                frame = self._frame
+                return frame
+            else:
+                print("Tele Cam frame not available")
+                return None
 
     def _shutdown(self):
         self._running = False
@@ -663,7 +679,7 @@ class _BaseCameraWidget2(QWidget):
 
 class UVC_CameraWidget(_BaseCameraWidget2):
     def __init__(self, label, index):
-        self.index = index
+        self.index = normal_camera_index_list[index]
         super().__init__(label)
     
     def _make_thread(self) -> QThread:
@@ -675,7 +691,7 @@ class UVC_CameraWidget(_BaseCameraWidget2):
         
 class BAS_CameraWidget(_BaseCameraWidget1):
     def __init__(self, label, index):
-        self.index = index
+        self.index = tele_camera_index_list[index]
         super().__init__(label)
     
     def _make_thread(self) -> QThread:
@@ -758,21 +774,12 @@ class ServoControlPanel(QWidget):
 
     def _build_ui(self):
         root_layout = QVBoxLayout()
-        title = QLabel("<b>Servo / PLC Control</b>")
+        title = QLabel("<b>Main Settings</b>")
         root_layout.addWidget(title)
 
-        # Target RPM
-        grp_rpm = QGroupBox("Target RPM (D150)")
-        form_rpm = QFormLayout()
-        self.entry_rpm = QLineEdit()
-        btn_set_rpm = QPushButton("Set RPM")
-        btn_set_rpm.clicked.connect(self.on_set_rpm)
-        form_rpm.addRow(self.entry_rpm, btn_set_rpm)
-        grp_rpm.setLayout(form_rpm)
-        root_layout.addWidget(grp_rpm)
-
         # Controls (momentary push buttons)
-        grp_ctrl = QGroupBox("Controls (momentary)")
+        grp_ctrl = QGroupBox("Servo Controls")
+        main_layout = QVBoxLayout()
         vctrl = QVBoxLayout()
         self.btn_start = QPushButton("Start (M31)")
         self.btn_start.setStyleSheet("background-color: #4CAF50; color: white;")
@@ -780,24 +787,100 @@ class ServoControlPanel(QWidget):
         vctrl.addWidget(self.btn_start)
 
         self.btn_stop = QPushButton("Stop (M30)")
-        self.btn_stop.setStyleSheet("background-color: #2196F3; color: white;")
+        # self.btn_stop.setStyleSheet("background-color: #2196F3; color: white;")
+        self.btn_stop.setStyleSheet("background-color: red; color: white;")
         self.btn_stop.pressed.connect(lambda: self._momentary_coil(30))
         vctrl.addWidget(self.btn_stop)
 
-        self.btn_estop = QPushButton("E-Stop (M0)")
-        self.btn_estop.setStyleSheet("background-color: red; color: white;")
-        self.btn_estop.pressed.connect(lambda: self._momentary_coil(0))
-        vctrl.addWidget(self.btn_estop)
+        # self.btn_estop = QPushButton("E-Stop (M0)")
+        # self.btn_estop.setStyleSheet("background-color: red; color: white;")
+        # self.btn_estop.pressed.connect(lambda: self._momentary_coil(0))
+        # vctrl.addWidget(self.btn_estop)
+        main_layout.addLayout(vctrl)
 
-        grp_ctrl.setLayout(vctrl)
+        # Target RPM
+        form_rpm = QFormLayout()
+        self.entry_rpm = QLineEdit()
+        btn_set_rpm = QPushButton("Set RPM")
+        btn_set_rpm.clicked.connect(self.on_set_rpm)
+        row_trig = QHBoxLayout()
+        row_trig.addWidget(self.entry_rpm)
+        row_trig.addWidget(btn_set_rpm)
+        wtr = QWidget()
+        wtr.setLayout(row_trig)
+        form_rpm.addRow("Target RPM (D150):", wtr)
+        main_layout.addLayout(form_rpm)
+
+        grp_ctrl.setLayout(main_layout)
+        root_layout.addWidget(grp_ctrl)
+
+        #Read positions
+        grp_read = QGroupBox("Disc plate Servo positions")
+        fpos = QFormLayout()
+        self.entry_triggered = QLineEdit()
+        self.entry_triggered.setReadOnly(True)
+        btn_read = QPushButton("Read Now")
+        btn_read.clicked.connect(self.on_read_now)
+        row_trig = QHBoxLayout()
+        row_trig.addWidget(self.entry_triggered)
+        row_trig.addWidget(btn_read)
+        wtr = QWidget()
+        wtr.setLayout(row_trig)
+        fpos.addRow("Triggered Pos (D100):", wtr)
+
+        self.entry_live = QLineEdit()
+        self.entry_live.setReadOnly(True)
+        fpos.addRow("Live Pos (HC104):", self.entry_live)
+        grp_read.setLayout(fpos)
+        root_layout.addWidget(grp_read)
+
+        # #Light control
+        # grp_ctrl = QGroupBox("Light Controls")
+        # main_layout = QVBoxLayout()
+
+        # # --- Normal Light ---
+        # self.btn_normal_light = QPushButton("Turn ON Normal Light (M3)")
+        # self.btn_normal_light.setCheckable(True)
+        # self.btn_normal_light.setStyleSheet("background-color: #4CAF50; color: white;")
+        # self.btn_normal_light.clicked.connect(lambda: self.toggle_light(self.btn_normal_light, 3))
+        # main_layout.addWidget(self.btn_normal_light)
+
+        # # --- Telecentric Light ---
+        # self.btn_tele_light = QPushButton("Turn ON Telecentric Light (M2)")
+        # self.btn_tele_light.setCheckable(True)
+        # self.btn_tele_light.setStyleSheet("background-color: #4CAF50; color: white;")
+        # self.btn_tele_light.clicked.connect(lambda: self.toggle_light(self.btn_tele_light, 2))
+        # main_layout.addWidget(self.btn_tele_light)
+
+        # grp_ctrl.setLayout(main_layout)
+        # root_layout.addWidget(grp_ctrl)
+
+
+        grp_ctrl = QGroupBox("Light Controls")
+        main_layout = QVBoxLayout()
+
+        # --- Normal Light Switch (M3) ---
+        self.switch_normal = QCheckBox("Normal Light (M3)")
+        self.switch_normal.setStyleSheet(self.switch_style())
+        self.switch_normal.stateChanged.connect(lambda state: self.toggle_light(3, state))
+        main_layout.addWidget(self.switch_normal)
+
+        # --- Telecentric Light Switch (M4) ---
+        self.switch_tele = QCheckBox("Tele Centric Light (M2)")
+        self.switch_tele.setStyleSheet(self.switch_style())
+        self.switch_tele.stateChanged.connect(lambda state: self.toggle_light(2, state))
+        main_layout.addWidget(self.switch_tele)
+
+        grp_ctrl.setLayout(main_layout)
         root_layout.addWidget(grp_ctrl)
 
         # Cam offsets (D6200, D6204, D6208, D6212)
-        grp_cam = QGroupBox("Cam Offsets (D6200..)")
+        # Cam offsets (D20200, D20204, D20208, D20212)
+        grp_cam = QGroupBox("Cam Offsets (D20200..)")
         fcam = QFormLayout()
         self.cam_entries = {}
         for i in range(1, 5):
-            addr = 6200 + (i-1)*4
+            addr = 20200 + (i-1)*4
             le = QLineEdit()
             btn = QPushButton(f"Write Cam {i}")
             btn.clicked.connect(lambda _, c=i: self.on_write_cam_offset(c))
@@ -829,26 +912,6 @@ class ServoControlPanel(QWidget):
             self.normal_cam_entries[i] = le
         grp_cam.setLayout(fcam)
         root_layout.addWidget(grp_cam)
-
-        #Read positions
-        grp_read = QGroupBox("Positions")
-        fpos = QFormLayout()
-        self.entry_triggered = QLineEdit()
-        self.entry_triggered.setReadOnly(True)
-        btn_read = QPushButton("Read Now")
-        btn_read.clicked.connect(self.on_read_now)
-        row_trig = QHBoxLayout()
-        row_trig.addWidget(self.entry_triggered)
-        row_trig.addWidget(btn_read)
-        wtr = QWidget()
-        wtr.setLayout(row_trig)
-        fpos.addRow("Triggered Pos (D100):", wtr)
-
-        self.entry_live = QLineEdit()
-        self.entry_live.setReadOnly(True)
-        fpos.addRow("Live Pos (HC104):", self.entry_live)
-        grp_read.setLayout(fpos)
-        root_layout.addWidget(grp_read)
 
         # Spacer to push things up
         root_layout.addItem(QSpacerItem(20, 40, QSP.Minimum, QSP.Expanding))
@@ -925,6 +988,57 @@ class ServoControlPanel(QWidget):
             self._show_error(str(e))
             return None
 
+    # def toggle_light(self, button, coil_addr):
+    #     """Toggle light ON/OFF based on current coil state."""
+    #     try:
+    #         # Read current coil state
+    #         state = self._read_coil(coil_addr)
+    #         if state is None:
+    #             return  # read failed
+            
+    #         # Toggle the state
+    #         new_state = not state
+    #         self._write_coil(coil_addr, new_state)
+
+    #         # Update button appearance and text
+    #         if new_state:
+    #             button.setText(f"Turn OFF {'Normal' if coil_addr==3 else 'Telecentric'} Light (M{coil_addr})")
+    #             button.setStyleSheet("background-color: #FF5252; color: white;")  # red for ON
+    #         else:
+    #             button.setText(f"Turn ON {'Normal' if coil_addr==3 else 'Telecentric'} Light (M{coil_addr})")
+    #             button.setStyleSheet("background-color: #4CAF50; color: white;")  # green for OFF
+
+    #     except Exception as e:
+    #         print(f"Error toggling light M{coil_addr}: {e}")
+
+    def toggle_light(self, coil_no, state):
+        # is_on = state == Qt.Checked
+        is_on = state
+        print(f"Coil {coil_no} {'ON' if is_on else 'OFF'}")
+        self._write_coil(coil_no, is_on)
+        print(f"Setting coil {coil_no} to {is_on}")
+
+    def switch_style(self):
+        return """
+        QCheckBox::indicator {
+            width: 50px;
+            height: 25px;
+        }
+        QCheckBox::indicator:unchecked {
+            border-radius: 12px;
+            background-color: #ccc;
+        }
+        QCheckBox::indicator:checked {
+            border-radius: 12px;
+            background-color: #4CAF50;
+        }
+        QCheckBox {
+            font-size: 14px;
+            padding: 6px;
+        }
+        """
+    
+
     # ---------------------------
     # UI callbacks
     # ---------------------------
@@ -944,6 +1058,7 @@ class ServoControlPanel(QWidget):
         addr, le = self.cam_entries[cam_idx]
         txt = le.text().strip()
         if txt == "":
+            self._show_error("empty text")
             return
         try:
             v = int(txt)
@@ -957,6 +1072,7 @@ class ServoControlPanel(QWidget):
         le = self.normal_cam_entries[cam_idx]
         txt = le.text().strip()
         if txt == "":
+            self._show_error("empty text")
             return
         try:
             v = int(txt)
@@ -1117,6 +1233,89 @@ class BrushStatusPanel(QWidget):
                 return True  # Successfully removed
         return False  # Brush ID not found
     
+
+class TrainingPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        root_layout = QVBoxLayout()
+        title = QLabel("<b>Training</b>")
+        root_layout.addWidget(title)
+
+        # --- Start Button ---
+        grp_ctrl = QGroupBox("Yolo Training Controls")
+        
+        layout = QVBoxLayout()
+        self.btn_start = QPushButton("Start Training")
+        self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        self.btn_start.clicked.connect(self.on_start_training)
+        layout.addWidget(self.btn_start)
+
+        # --- Stop Button ---
+        self.btn_stop = QPushButton("Stop Training")
+        self.btn_stop.setStyleSheet("background-color: red; color: white; font-weight: bold;")
+        self.btn_stop.clicked.connect(self.on_stop_training)
+        layout.addWidget(self.btn_stop)
+
+        # layout.addStretch()
+        # self.setLayout(layout)
+        grp_ctrl.setLayout(layout)
+        root_layout.addWidget(grp_ctrl)
+
+        # Spacer to push things up
+        root_layout.addItem(QSpacerItem(20, 40, QSP.Minimum, QSP.Expanding))
+        self.setLayout(root_layout)
+
+    # --- Methods called when buttons are pressed ---
+    def on_start_training(self):
+        global take_picture
+        if not take_picture:
+            print("Training started")
+            take_picture = True
+            self.create_folder_for_normal_cameras()
+            self.create_folder_for_tele_cameras()
+        # TODO: add your start logic here (e.g. self.parent().start_training_process())
+
+    def on_stop_training(self):
+        global take_picture
+        if take_picture:
+            print("Training stopped")
+            take_picture = False
+
+
+    def create_folder_for_normal_cameras(self):
+        self.create_folder_for_cameras(normal_camera_image_folder, 6)
+    
+    def create_folder_for_tele_cameras(self):
+        self.create_folder_for_cameras(tele_camera_image_folder, 4)
+
+    def create_folder_for_cameras(self, base_path, index):
+        for(cam_idx) in range(1, index+1):
+            cam_folder_path = os.path.join(base_path, f"Camera_{cam_idx}")
+            self.create_folder_if_not_exists(cam_folder_path)
+            
+    def create_folder_if_not_exists(self, folder_path):
+        global folder_brush_no
+
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        # Base path
+        base_path = folder_path
+        # Get list of folders inside base_path
+        subfolders = [f for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f))]
+        # Filter numeric folder names only
+        numbers = [int(f) for f in subfolders if f.isdigit()]
+        # Find next folder number
+        next_number = max(numbers) + 1 if numbers else 1
+        # Build new folder path
+        new_folder = os.path.join(base_path, str(next_number))
+        # Create the new folder
+        os.makedirs(new_folder, exist_ok=True)
+        folder_brush_no = next_number
+        
+        print(f"✅ Created folder: {new_folder}")
+
 # -----------------------------
 # Main window (modified to add Servo panel on right side)
 # -----------------------------
@@ -1167,10 +1366,12 @@ class MainWindow(QMainWindow):
         # Create brush status and servo panels
         self.brush_status_panel = BrushStatusPanel()
         self.servo_panel = ServoControlPanel()
+        self.training_panel = TrainingPanel()  # <-- new panel
 
         # Add both as tabs
         self.right_tabs.addTab(self.brush_status_panel, "Brush Status")
         self.right_tabs.addTab(self.servo_panel, "Settings")
+        self.right_tabs.addTab(self.training_panel, "Training")  # <-- add new tab
 
         # Default show Brush Status
         self.right_tabs.setCurrentIndex(0)
@@ -1223,52 +1424,132 @@ class BrushThread():
         self.tele_cameras = tele_cameras 
         self.servo_panel = servo_panel
         self.brush_status_panel = brush_status_panel
-        self.run = threading.Thread(target=self.run)
-        self.run.start()
+        self.delay = 0.050
+        self.tolarance = 400
+        self.run()
 
     def run(self):
+        self.run_normal_cam_thread = threading.Thread(target=self.run_normal_camera)
+        self.run_normal_cam_thread.start()
+        self.run_tele_cam_thread = threading.Thread(target=self.run_tele_camera)
+        self.run_tele_cam_thread.start()
+        
+    def run_normal_camera(self):
         normal_camere_future_positions = []
-        tele_camera_future_positions = []
-        for cam in self.normal_cameras:
+        # for cam in self.normal_cameras:
+        #     #print(cam.index)
+        #     normal_cam_position = normal_cam_offset_value_read(cam.index)
+        #     if normal_cam_position:
+        #         normal_camere_future_positions.append(int(normal_cam_position)+self.sensorTriggeredPosition)
+        #     else:
+        #         normal_camere_future_positions.append(0)
+
+        for index in range(0,6):
             #print(cam.index)
-            normal_cam_position = normal_cam_offset_value_read(cam.index)
+            normal_cam_position = normal_cam_offset_value_read(index)
             if normal_cam_position:
                 normal_camere_future_positions.append(int(normal_cam_position)+self.sensorTriggeredPosition)
             else:
                 normal_camere_future_positions.append(0)
-        for cam in self.tele_cameras:
-            tele_cam_position = tele_cam_offset_value_read(cam.index)
+
+        normal_cam_index=0
+        # print("Normal Cam positions: ")
+        # print(normal_camere_future_positions)
+        
+        while(normal_cam_index < len(normal_camere_future_positions)):  
+            #start_time = time.time()  
+            livePosition = int(self.servo_panel._read_register(104))
+            #end_time = time.time()
+            #print(f"⏱️ Time taken: {end_time - start_time:.4f} seconds")
+            #print("Live Position: "+str(livePosition))
+            #print(normal_camere_future_positions)
+            #print("Normal Cam future position: "+str(normal_camere_future_positions[normal_cam_index]))
+            if(livePosition is not None and normal_camere_future_positions[normal_cam_index]-self.tolarance <= livePosition):
+                print(f"Capturing images for Brush ID: {self.brushID} at position {livePosition} for Normal Camera {normal_cam_index+1}")
+                # Update brush 101, camera 3 → "OK"
+                self.brush_status_panel.update_brush_status(self.brushID, normal_cam_index+1, "Good")
+                self.read_normal_camera_image(self.brushID, normal_cam_index+1, self.normal_cameras[normal_cam_index].getCameraThread().capture_image())
+                normal_cam_index+=1
+            elif(livePosition is not None and livePosition >= normal_camere_future_positions[normal_cam_index]+self.tolarance):
+                print(f"Out off range - Not Capturing images for Brush ID: {self.brushID} at position {livePosition} for Normal Camera {normal_cam_index+1}")
+                self.brush_status_panel.update_brush_status(self.brushID, normal_cam_index+1, "Not Captured")
+                normal_cam_index+=1
+
+            time.sleep(self.delay)
+            # time.sleep(2)
+        print("Normal camera closed")
+
+    def run_tele_camera(self):
+        tele_camera_future_positions = []
+
+        # for cam in self.tele_cameras:
+        #     tele_cam_position = tele_cam_offset_value_read(cam.index)
+        #     if tele_cam_position:
+        #         tele_camera_future_positions.append(int(tele_cam_position)+self.sensorTriggeredPosition)
+        #     else:
+        #         tele_camera_future_positions.append(0)
+
+        for index in range(0,4):
+            tele_cam_position = tele_cam_offset_value_read(index)
             if tele_cam_position:
                 tele_camera_future_positions.append(int(tele_cam_position)+self.sensorTriggeredPosition)
             else:
                 tele_camera_future_positions.append(0)
 
-        tolarance=400
-        normal_cam_index=0
         tele_cam_index=0
+        # print("Normal Cam positions: ")
+        # print(normal_camere_future_positions)
         
-        while(True):    
+        while(tele_cam_index < len(tele_camera_future_positions)):  
+            #start_time = time.time()
             livePosition = int(self.servo_panel._read_register(104))
+            #end_time = time.time()
+            #print(f"⏱️ Time taken: {end_time - start_time:.4f} seconds")
             #print("Live Position: "+str(livePosition))
             #print(normal_camere_future_positions)
             #print("Normal Cam future position: "+str(normal_camere_future_positions[normal_cam_index]))
-            if(normal_cam_index < len(normal_camere_future_positions)):
-                if(livePosition is not None and normal_camere_future_positions[normal_cam_index]-tolarance <= livePosition <= normal_camere_future_positions[normal_cam_index]+tolarance):
-                    print(f"Capturing images for Brush ID: {self.brushID} at position {livePosition} for Normal Camera {normal_cam_index+1}")
-                    # Update brush 101, camera 3 → "OK"
-                    self.brush_status_panel.update_brush_status(self.brushID, normal_cam_index+1, "Good")
-                    self.normal_cameras[normal_cam_index].getCameraThread().capture_image()
-                    normal_cam_index+=1
-            
-            if(tele_cam_index < len(tele_camera_future_positions)):
-                if(livePosition is not None and tele_camera_future_positions[tele_cam_index]-tolarance <= livePosition <= tele_camera_future_positions[tele_cam_index]+tolarance):
-                    print(f"Capturing images for Brush ID: {self.brushID} at position {livePosition} for Tele Camera {tele_cam_index+1}")
-                    self.brush_status_panel.update_brush_status(self.brushID, 6 + tele_cam_index + 1, "Good")
-                    self.tele_cameras[tele_cam_index].getCameraThread().capture_image()
-                    tele_cam_index+=1
+            if(livePosition is not None and tele_camera_future_positions[tele_cam_index]-self.tolarance <= livePosition):
+                print(f"Capturing images for Brush ID: {self.brushID} at position {livePosition} for Tele Camera {tele_cam_index+1}")
+                self.brush_status_panel.update_brush_status(self.brushID, 6 + tele_cam_index + 1, "Good")
+                tele_image = self.tele_cameras[tele_cam_index].getCameraThread().capture_image()
+                if tele_image is not None:
+                    self.read_tele_camera_image(self.brushID, tele_cam_index+1, tele_image)
+                else:
+                    print(f"Not Capturing images for Brush ID: {self.brushID} at position {livePosition} for Tele Camera {tele_cam_index+1}")
+                tele_cam_index+=1
+            elif(livePosition is not None and livePosition >= tele_camera_future_positions[tele_cam_index]+self.tolarance):
+                print(f"Out off range - Capturing images for Brush ID: {self.brushID} at position {livePosition} for Tele Camera {tele_cam_index+1}")
+                self.brush_status_panel.update_brush_status(self.brushID, 6 + tele_cam_index + 1, "Not Captured")
+                tele_cam_index+=1
 
-            time.sleep(0.01)
+            time.sleep(self.delay)
+            # time.sleep(2)
+        print("Tele camera closed")
+
+    def read_normal_camera_image(self, brushID, cameraId, frame):
+        if take_picture:
+            folder_path = os.path.join(normal_camera_image_folder, f"Camera_{cameraId}")
+            folder_path = os.path.join(folder_path, str(folder_brush_no))
+
+            if not os.path.exists(folder_path):
+                os.makedirs(folder_path)
+            timestamp = int(time.time() * 1000)
+            filename = os.path.join(folder_path, f"normal_cam_{cameraId}_brush_{brushID}_{timestamp}.png")
+            cv2.imwrite(filename, frame)
+            print(f"Saved Normal Camera image: {filename}")
     
+    def read_tele_camera_image(self, brushID, cameraId, frame):
+        if take_picture:
+            folder_path = os.path.join(tele_camera_image_folder, f"Camera_{cameraId}")
+            folder_path = os.path.join(folder_path, str(folder_brush_no))
+
+            if not os.path.exists(folder_path):
+                os.makedirs(folder_path)
+            timestamp = int(time.time() * 1000)
+            filename = os.path.join(folder_path, f"tele_cam_{cameraId}_brush_{brushID}_{timestamp}.png")
+            cv2.imwrite(filename, frame)
+            print(f"Saved Normal Camera image: {filename}")
+
 # -----------------------------
 # Example: optional processor hook (kept same)
 # -----------------------------
