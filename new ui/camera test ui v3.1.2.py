@@ -49,23 +49,24 @@ plc_ip = "192.168.1.5"
 camera_index_list = [0,1,2,3,4,5]
 normal_cam_offset_value=[]
 tele_cam_offset_value=[]
-# tele_camera_wait_for_frame = 25000
-tele_camera_wait_for_frame = 100
+tele_camera_wait_for_frame = 25000
+#tele_camera_wait_for_frame = 100
 
 with open("configuration.json", "r") as file:
     json_data = json.load(file)
 
 camera_index_list = json_data["camera_index_list"]
 
-FILE_PATH = "camera_data.txt"
+NORMAL_CAM_FILE_PATH = "normal_camera_data.txt"
+TELE_CAM_FILE_PATH = "tele_camera_data.txt"
 
 def normal_cam_offset_value_write(cam_index, value):
-    cam_offset_value_write("Normal_cam:"+str(cam_index), value)
+    cam_offset_value_write(NORMAL_CAM_FILE_PATH, "Normal_cam:"+str(cam_index), value)
 
 def tele_cam_offset_value_write(cam_index, value):
-    cam_offset_value_write("Tele_cam:"+str(cam_index), value)
+    cam_offset_value_write(TELE_CAM_FILE_PATH ,"Tele_cam:"+str(cam_index), value)
     
-def cam_offset_value_write(cam_index, value):
+def cam_offset_value_write(FILE_PATH, cam_index, value):
     """Write or update a camera index and its value in the file."""
     if file_lock:
         data = {}
@@ -91,7 +92,7 @@ def normal_cam_offset_value_read(cam_index):
     if len(normal_cam_offset_value) < 6:
         normal_cam_offset_value=[]
         for i in range(1,7):
-            normal_cam_offset_value.append(cam_offset_value_read("Normal_cam:"+str(i)))
+            normal_cam_offset_value.append(normal_cam_offset_value_read("Normal_cam:"+str(i)))
     return normal_cam_offset_value[cam_index]
 
 def tele_cam_offset_value_read(cam_index):
@@ -99,16 +100,29 @@ def tele_cam_offset_value_read(cam_index):
     if len(tele_cam_offset_value) < 4:
         tele_cam_offset_value=[]
         for i in range(1,5):
-            tele_cam_offset_value.append(cam_offset_value_read("Tele_cam:"+str(i)))
+            tele_cam_offset_value.append(tele_cam_offset_value_read("Tele_cam:"+str(i)))
     return tele_cam_offset_value[cam_index]
     
-def cam_offset_value_read(cam_index):
+def normal_cam_offset_value_read(cam_index):
     """Read a camera index value from the file."""
     if file_lock:
-        if not os.path.exists(FILE_PATH):
+        if not os.path.exists(NORMAL_CAM_FILE_PATH):
             return None
 
-        with open(FILE_PATH, "r") as f:
+        with open(NORMAL_CAM_FILE_PATH, "r") as f:
+            for line in f:
+                parts = line.strip().split("=", 1)
+                if len(parts) == 2 and parts[0] == str(cam_index):
+                    return parts[1]
+        return None
+
+def tele_cam_offset_value_read(cam_index):
+    """Read a camera index value from the file."""
+    if file_lock:
+        if not os.path.exists(TELE_CAM_FILE_PATH):
+            return None
+
+        with open(TELE_CAM_FILE_PATH, "r") as f:
             for line in f:
                 parts = line.strip().split("=", 1)
                 if len(parts) == 2 and parts[0] == str(cam_index):
@@ -143,7 +157,7 @@ class UVC_CameraThread(QThread):
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0)
-        self._cap.set(cv2.CAP_PROP_EXPOSURE, -9)
+        self._cap.set(cv2.CAP_PROP_EXPOSURE, -10)
         self._cap.set(cv2.CAP_PROP_GAIN, 5)
         self._cap.set(cv2.CAP_PROP_FPS, 30)
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -157,10 +171,12 @@ class UVC_CameraThread(QThread):
         obj_present=False
         
         while self._running:
+            if not self._cap.isOpened():
+                self._cap = cv2.VideoCapture(camera_index_list[self.index], cv2.CAP_DSHOW)
+                time.sleep(2.5)
             ok, frame = self._cap.read()
             if not ok:
                 self.error_signal.emit(f"UVC {self.index}: read failed")
-                break
             '''
             if first_frame:
                 Test_frame = cv2.resize(frame, (frame.shape[1]//2, frame.shape[0]//2))
@@ -204,14 +220,17 @@ class UVC_CameraThread(QThread):
             #     except Exception as e:
             #         # inference errors shouldn't crash camera thread
             #         pass
-
-            self.frame_ready.emit(FramePacket(frame))
-            frames += 1
-            now = time.time()
-            if now - last >= 1.0:
-                self.fps_updated.emit(frames / (now - last))
-                frames = 0
-                last = now
+            if ok:
+                self.frame_ready.emit(FramePacket(frame))
+                self._frame=frame
+                frames += 1
+                now = time.time()
+                if now - last >= 1.0:
+                    self.fps_updated.emit(frames / (now - last))
+                    frames = 0
+                    last = now
+                
+            time.sleep(0.05)
 
         try:
             if self._cap is not None:
@@ -222,7 +241,7 @@ class UVC_CameraThread(QThread):
 
     def capture_image(self):
         if(self._running):
-           frame = self._cap.read()
+           frame = self._frame
            return frame
  
     def stop(self):
@@ -243,9 +262,8 @@ class BAS_CameraThread(QThread):
         self._camera: Optional[pylon.InstantCamera] = None
 
     def run(self):
-        trigger=1
-        # if (self.index==3): #remove this after the  telecentric camera 1 is wired
-        #     trigger=0
+        trigger=0
+        
         try:
             tlf = pylon.TlFactory.GetInstance()
             devices = tlf.EnumerateDevices()
@@ -303,11 +321,13 @@ class BAS_CameraThread(QThread):
 
     def capture_image(self):
         if(self._running):
-           if(self._frame):
-                frame = self._frame
-                return frame
-           else:
-               print("Tele Cam frame not available")
+            frame = self._frame
+            return frame
+          #if(self._frame!=None):
+          #      frame = self._frame
+          #      return frame
+          #else:
+          #     print("Tele Cam frame not available")'''
 
     def _shutdown(self):
         self._running = False
@@ -1223,7 +1243,7 @@ class BrushThread():
             else:
                 tele_camera_future_positions.append(0)
 
-        tolarance=200
+        tolarance=400
         normal_cam_index=0
         tele_cam_index=0
         
@@ -1247,7 +1267,7 @@ class BrushThread():
                     self.tele_cameras[tele_cam_index].getCameraThread().capture_image()
                     tele_cam_index+=1
 
-            time.sleep(0.1)
+            time.sleep(0.01)
     
 # -----------------------------
 # Example: optional processor hook (kept same)

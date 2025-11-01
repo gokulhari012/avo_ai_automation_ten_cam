@@ -1,0 +1,4 @@
+Tele_cam:1=3500
+Tele_cam:2=8050
+Tele_cam:3=12400
+Tele_cam:4=16000
